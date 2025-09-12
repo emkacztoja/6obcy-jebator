@@ -19,9 +19,24 @@ let typingState = false;
 let typingTimeout = null;
 let isSolved = false;
 let port = 3000;
+let autoRespond = false;
+let messageHistory = [];
 
 if (process.env.CAPTCHA2_API) CAPI = process.env.CAPTCHA2_API;
 else CAPI = false;
+
+let DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || null;
+
+const addToHistory = (role, content) => {
+  messageHistory.push({ role, content });
+  if (messageHistory.length > 8) {
+    messageHistory.shift();
+  }
+};
+
+const clearHistory = () => {
+  messageHistory = [];
+};
 
 const spinner = ora({
   hideCursor: false,
@@ -89,6 +104,7 @@ const sendMessage = (msg) => {
     idn: 0,
   });
 
+  addToHistory("assistant", msg);
   SendSystemMessage(colors.bot("Ja: ") + colors.message(msg));
 
   Typing(false);
@@ -205,16 +221,37 @@ const _handleConversationStart = (msgData) => {
 
   box.setContent("");
   messageList.setContent("");
+  clearHistory();
 
   SendSystemMessage(colors.warn("Połączono z obcym...       "));
 
   process.env.WELCOME && sendMessage(process.env.WELCOME);
 };
 
-const _handleStrangerMessage = (msgData) => {
+const _handleStrangerMessage = async (msgData) => {
   const uMsg = msgData.ev_data.msg;
 
+  addToHistory("user", uMsg);
   SendSystemMessage(colors.obcy("Obcy: ") + colors.message(uMsg));
+
+  if (autoRespond) {
+    SendSystemMessage(colors.info("🤖 Generuję odpowiedź..."));
+    box.setContent("AI generuje odpowiedź...");
+    screen.render();
+
+    const response = await generateResponse();
+
+    box.setContent("");
+    screen.render();
+
+    if (response) {
+      addToHistory("assistant", response);
+      SendSystemMessage(colors.bot("Ja (AI): ") + colors.message(response));
+      setTimeout(() => sendMessage(response), 1000);
+    } else {
+      SendSystemMessage(colors.warn("❌ Nie udało się wygenerować odpowiedzi"));
+    }
+  }
 };
 
 const _handleCN = (msg) => {
@@ -238,7 +275,6 @@ const _handleCaptacha = async (msg) => {
       AskForCaptcha(captchaID);
     }, 10000);
   } else {
-    // TODO
     captchaBase64 = base64;
     input.show();
     input.focus();
@@ -291,7 +327,7 @@ const AskForCaptcha = (captchaId) => {
           spinner.start("Rozwiązuje captche, jeszcze chwilkę...");
 
           return AskForCaptcha(captchaID);
-        }, 5000); // if not ready wait 10sec and ask again
+        }, 5000);
       }
 
       SolveCaptcha(solved);
@@ -346,8 +382,57 @@ const StopConv = () => {
 
   box.setContent("");
   messageList.setContent("");
+  clearHistory();
 
   SendSystemMessage(colors.warn("Zakończono, aby wznowić wpisz /start"));
+};
+
+const generateResponse = async () => {
+  if (!DEEPSEEK_API_KEY) {
+    SendSystemMessage(colors.warn("Brak klucza API DeepSeek"));
+    return null;
+  }
+
+  try {
+    const messages = [
+      {
+        role: "system",
+        content: "Jesteś Kasia, 17-letnia dziewczyna (k17) z Warszawy. Na pytania o wiek/płeć odpowiadaj zawsze 'k17'. Pisz bardzo krótko, po polsku, w stylu nastolatki na czacie. Używaj prostych, casualowych odpowiedzi, czasem emotki. Zadawaj krótkie pytania zwrotne, żeby rozmowa się nie kończyła. Bądź przyjazna, lekko urocza i na luzie.",
+      },
+      ...messageHistory
+    ];
+
+    const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: messages,
+        max_tokens: 150,
+        temperature: 0.5,
+      }),
+    });
+
+    const data = await response.json();
+    if (data.choices && data.choices[0]) {
+      let generatedResponse = data.choices[0].message.content.trim();
+
+      generatedResponse = generatedResponse
+        .replace(/\?{2,}/g, '?')
+        .replace(/\.{2,}/g, '.')
+        .replace(/\!{2,}/g, '!')
+        .replace(/^[\?\.\!\s]+|[\?\.\!\s]+$/g, '')
+        .substring(0, 200);
+
+      return generatedResponse;
+    }
+  } catch (error) {
+    SendSystemMessage(colors.warn("Błąd podczas generowania odpowiedzi: " + error.message));
+  }
+  return null;
 };
 
 const SendSystemMessage = (msg) => {
@@ -358,10 +443,6 @@ const SendSystemMessage = (msg) => {
 
   screen.render();
 };
-
-//
-// TUI
-//
 
 const screen = blessed.screen({
   smartCSR: true,
@@ -427,6 +508,9 @@ input.key("enter", function () {
       startConversation();
     } else if (message === "/stop\n") {
       StopConv();
+    } else if (message === "/auto\n") {
+      autoRespond = !autoRespond;
+      SendSystemMessage(colors.info(`Auto-odpowiedzi: ${autoRespond ? "włączone" : "wyłączone"}`));
     } else {
       if (captchaBase64.length === 0) {
         if (message.length > 1) sendMessage(message);
