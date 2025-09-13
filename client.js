@@ -21,6 +21,7 @@ let isSolved = false;
 let port = 3000;
 let autoRespond = false;
 let messageHistory = [];
+let recentResponses = [];
 
 if (process.env.CAPTCHA2_API) CAPI = process.env.CAPTCHA2_API;
 else CAPI = false;
@@ -34,8 +35,55 @@ const addToHistory = (role, content) => {
   }
 };
 
+const addRecentResponse = (response) => {
+  recentResponses.push(response.toLowerCase());
+  if (recentResponses.length > 5) {
+    recentResponses.shift();
+  }
+};
+
+const isResponseTooSimilar = (newResponse) => {
+  const lowerNew = newResponse.toLowerCase();
+  return recentResponses.some(recent => {
+    const similarity = calculateSimilarity(lowerNew, recent);
+    return similarity > 0.7;
+  });
+};
+
+const calculateSimilarity = (str1, str2) => {
+  const longer = str1.length > str2.length ? str1 : str2;
+  const shorter = str1.length > str2.length ? str2 : str1;
+  if (longer.length === 0) return 1.0;
+  return (longer.length - levenshteinDistance(longer, shorter)) / longer.length;
+};
+
+const levenshteinDistance = (str1, str2) => {
+  const matrix = [];
+  for (let i = 0; i <= str2.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= str1.length; j++) {
+    matrix[0][j] = j;
+  }
+  for (let i = 1; i <= str2.length; i++) {
+    for (let j = 1; j <= str1.length; j++) {
+      if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[str2.length][str1.length];
+};
+
 const clearHistory = () => {
   messageHistory = [];
+  recentResponses = [];
 };
 
 const spinner = ora({
@@ -97,14 +145,18 @@ const disConnect = () => {
   });
 };
 
-const sendMessage = (msg) => {
+const sendMessage = (msg, isAI = false) => {
   _emitSocketEvent("_pmsg", {
     ckey: ckey,
     msg,
     idn: 0,
   });
 
-  addToHistory("assistant", msg);
+  if (!isAI) {
+    addToHistory("assistant", msg);
+  } else {
+    addRecentResponse(msg);
+  }
   SendSystemMessage(colors.bot("Ja: ") + colors.message(msg));
 
   Typing(false);
@@ -225,7 +277,7 @@ const _handleConversationStart = (msgData) => {
 
   SendSystemMessage(colors.warn("Połączono z obcym...       "));
 
-  process.env.WELCOME && sendMessage(process.env.WELCOME);
+  process.env.WELCOME && sendMessage(process.env.WELCOME, true);
 };
 
 const _handleStrangerMessage = async (msgData) => {
@@ -235,9 +287,11 @@ const _handleStrangerMessage = async (msgData) => {
   SendSystemMessage(colors.obcy("Obcy: ") + colors.message(uMsg));
 
   if (autoRespond) {
-    SendSystemMessage(colors.info("🤖 Generuję odpowiedź..."));
-    box.setContent("AI generuje odpowiedź...");
-    screen.render();
+    setTimeout(() => {
+      SendSystemMessage(colors.info("🤖 Generuję odpowiedź..."));
+      box.setContent("AI generuje odpowiedź...");
+      screen.render();
+    }, 200);
 
     const response = await generateResponse();
 
@@ -245,9 +299,8 @@ const _handleStrangerMessage = async (msgData) => {
     screen.render();
 
     if (response) {
-      addToHistory("assistant", response);
-      SendSystemMessage(colors.bot("Ja (AI): ") + colors.message(response));
-      setTimeout(() => sendMessage(response), 1000);
+      const typingDelay = 800 + Math.random() * 1200;
+      setTimeout(() => sendMessage(response, true), typingDelay);
     } else {
       SendSystemMessage(colors.warn("❌ Nie udało się wygenerować odpowiedzi"));
     }
@@ -387,7 +440,45 @@ const StopConv = () => {
   SendSystemMessage(colors.warn("Zakończono, aby wznowić wpisz /start"));
 };
 
-const generateResponse = async () => {
+const cleanAndVaryResponse = (response) => {
+  let cleaned = response
+    .replace(/\?\s*\?/g, '?')
+    .replace(/\.{2,}/g, '.')
+    .replace(/\!{2,}/g, '!')
+    .replace(/\?\s*$/g, '?')
+    .replace(/^[\?\.\!\s]+|[\?\.\!\s]+$/g, '')
+    .trim();
+
+  const variations = [
+    (text) => text.replace(/\bco tam\b/gi, Math.random() > 0.5 ? 'co tam' : 'co słychać'),
+    (text) => text.replace(/\bspoko\b/gi, Math.random() > 0.5 ? 'spoko' : 'okej'),
+    (text) => text.replace(/\blol\b/gi, Math.random() > 0.5 ? 'lol' : 'xD'),
+    (text) => text.replace(/\bhej\b/gi, Math.random() > 0.5 ? 'hej' : 'cześć'),
+  ];
+
+  variations.forEach(variation => {
+    if (Math.random() > 0.7) {
+      cleaned = variation(cleaned);
+    }
+  });
+
+  const personalityAdditions = [
+    () => Math.random() > 0.8 ? cleaned + ' :)' : cleaned,
+    () => Math.random() > 0.9 ? cleaned + ' :P' : cleaned,
+    () => Math.random() > 0.85 ? 'Hmm, ' + cleaned : cleaned,
+    () => Math.random() > 0.9 ? cleaned + ' no wiesz?' : cleaned,
+  ];
+
+  personalityAdditions.forEach(addition => {
+    if (Math.random() > 0.7) {
+      cleaned = addition();
+    }
+  });
+
+  return cleaned.substring(0, 150);
+};
+
+const generateResponse = async (retryCount = 0) => {
   if (!DEEPSEEK_API_KEY) {
     SendSystemMessage(colors.warn("Brak klucza API DeepSeek"));
     return null;
@@ -397,7 +488,7 @@ const generateResponse = async () => {
     const messages = [
       {
         role: "system",
-        content: "Jesteś Kasia, 17-letnia dziewczyna (k17) z Warszawy. Na pytania o wiek/płeć odpowiadaj zawsze 'k17'. Pisz bardzo krótko, po polsku, w stylu nastolatki na czacie. Używaj prostych, casualowych odpowiedzi, czasem emotki. Zadawaj krótkie pytania zwrotne, żeby rozmowa się nie kończyła. Bądź przyjazna, lekko urocza i na luzie.",
+        content: "Jesteś Kasia, 17-letnia dziewczyna z Warszawy. Masz na imię Kasia, jesteś w 3 klasie liceum, mieszkasz na Pradze. Lubisz muzykę pop, seriale na Netflixie i spotykanie się ze znajomymi. Odpowiadaj zawsze jako k17 na pytania o wiek/płeć. Pisz bardzo naturalnie, tak jak nastolatka na czacie - używaj skrótów typu 'co tam', 'spoko', 'lol', 'xD', 'okej'. Czasem dodawaj emotki jak :) :( :P. Nie pisz zbyt formalnie ani zbyt długich odpowiedzi. Zawsze zadawaj pytania zwrotne żeby rozmowa trwała. Unikaj powtarzania tych samych odpowiedzi. Bądź wesoła, otwarta i ciekawa świata. Jeśli ktoś pyta o coś osobistego, odpowiadaj szczerze ale nie ujawniaj zbyt wiele. Pamiętaj - jesteś prawdziwą dziewczyną, nie botem!",
       },
       ...messageHistory
     ];
@@ -411,8 +502,8 @@ const generateResponse = async () => {
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: messages,
-        max_tokens: 150,
-        temperature: 0.5,
+        max_tokens: 120,
+        temperature: retryCount > 0 ? 0.9 : 0.8,
       }),
     });
 
@@ -420,12 +511,11 @@ const generateResponse = async () => {
     if (data.choices && data.choices[0]) {
       let generatedResponse = data.choices[0].message.content.trim();
 
-      generatedResponse = generatedResponse
-        .replace(/\?{2,}/g, '?')
-        .replace(/\.{2,}/g, '.')
-        .replace(/\!{2,}/g, '!')
-        .replace(/^[\?\.\!\s]+|[\?\.\!\s]+$/g, '')
-        .substring(0, 200);
+      generatedResponse = cleanAndVaryResponse(generatedResponse);
+
+      if (retryCount < 3 && isResponseTooSimilar(generatedResponse)) {
+        return generateResponse(retryCount + 1);
+      }
 
       return generatedResponse;
     }
