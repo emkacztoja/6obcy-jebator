@@ -22,11 +22,13 @@ let port = 3000;
 let autoRespond = false;
 let messageHistory = [];
 let recentResponses = [];
+let isGeneratingResponse = false;
+let pendingMessage = null;
 
 if (process.env.CAPTCHA2_API) CAPI = process.env.CAPTCHA2_API;
 else CAPI = false;
 
-let DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || null;
+let OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
 const addToHistory = (role, content) => {
   messageHistory.push({ role, content });
@@ -46,7 +48,7 @@ const isResponseTooSimilar = (newResponse) => {
   const lowerNew = newResponse.toLowerCase();
   return recentResponses.some(recent => {
     const similarity = calculateSimilarity(lowerNew, recent);
-    return similarity > 0.7;
+    return similarity > 0.85;
   });
 };
 
@@ -274,6 +276,8 @@ const _handleConversationStart = (msgData) => {
   box.setContent("");
   messageList.setContent("");
   clearHistory();
+  isGeneratingResponse = false;
+  pendingMessage = null;
 
   SendSystemMessage(colors.warn("Połączono z obcym...       "));
 
@@ -287,22 +291,67 @@ const _handleStrangerMessage = async (msgData) => {
   SendSystemMessage(colors.obcy("Obcy: ") + colors.message(uMsg));
 
   if (autoRespond) {
+    if (isGeneratingResponse) {
+      if (!pendingMessage) {
+        pendingMessage = uMsg;
+        SendSystemMessage(colors.info("Oczekiwanie na nowa wiadomosc..."));
+      }
+      return;
+    }
+
+    isGeneratingResponse = true;
+    pendingMessage = null;
+
     setTimeout(() => {
-      SendSystemMessage(colors.info("🤖 Generuję odpowiedź..."));
-      box.setContent("AI generuje odpowiedź...");
+      if (!isGeneratingResponse) return;
+      box.setContent("Generuje odpowiedz...");
       screen.render();
     }, 200);
 
-    const response = await generateResponse();
+    try {
+      console.log("Starting response generation...");
+      const response = await generateResponse();
+      console.log("Response generated:", response);
 
-    box.setContent("");
-    screen.render();
+      if (!isGeneratingResponse) {
+        console.log("Generation was cancelled");
+        return;
+      }
 
-    if (response) {
-      const typingDelay = 800 + Math.random() * 1200;
-      setTimeout(() => sendMessage(response, true), typingDelay);
-    } else {
-      SendSystemMessage(colors.warn("❌ Nie udało się wygenerować odpowiedzi"));
+      box.setContent("");
+      screen.render();
+
+      if (response) {
+        const typingDelay = 1 + Math.random() * 1;
+        console.log("Sending response in", typingDelay, "ms");
+        setTimeout(() => {
+          if (!isGeneratingResponse) {
+            console.log("Generation cancelled before sending");
+            return;
+          }
+          console.log("Actually sending message:", response);
+          sendMessage(response, true);
+          isGeneratingResponse = false;
+        }, typingDelay);
+      } else {
+        console.log("No response generated");
+        SendSystemMessage(colors.warn("Nie udało się wygenerować odpowiedzi"));
+        isGeneratingResponse = false;
+      }
+    } catch (error) {
+      console.log("Error during response generation:", error.message);
+      SendSystemMessage(colors.warn("Błąd: " + error.message));
+      box.setContent("");
+      screen.render();
+      isGeneratingResponse = false;
+    }
+
+    if (pendingMessage) {
+      const nextMsg = pendingMessage;
+      pendingMessage = null;
+      setTimeout(() => {
+        _handleStrangerMessage({ ev_data: { msg: nextMsg } });
+      }, 500);
     }
   }
 };
@@ -340,6 +389,11 @@ const _handleCaptacha = async (msg) => {
 const onConnected = () => {
   input.hide();
   spinner.succeed(`Połączono z serwerem...`);
+
+  setTimeout(() => {
+    SendSystemMessage(colors.info("Bot gotowy! Wpisz /auto aby włączyć auto-odpowiedzi"));
+    SendSystemMessage(colors.info("Dostępne komendy: /auto, /cancel, /start, /stop, /topic"));
+  }, 1000);
 };
 
 const parseJson = (str) => {
@@ -436,6 +490,8 @@ const StopConv = () => {
   box.setContent("");
   messageList.setContent("");
   clearHistory();
+  isGeneratingResponse = false;
+  pendingMessage = null;
 
   SendSystemMessage(colors.warn("Zakończono, aby wznowić wpisz /start"));
 };
@@ -463,8 +519,6 @@ const cleanAndVaryResponse = (response) => {
   });
 
   const personalityAdditions = [
-    () => Math.random() > 0.8 ? cleaned + ' :)' : cleaned,
-    () => Math.random() > 0.9 ? cleaned + ' :P' : cleaned,
     () => Math.random() > 0.85 ? 'Hmm, ' + cleaned : cleaned,
     () => Math.random() > 0.9 ? cleaned + ' no wiesz?' : cleaned,
   ];
@@ -479,50 +533,79 @@ const cleanAndVaryResponse = (response) => {
 };
 
 const generateResponse = async (retryCount = 0) => {
-  if (!DEEPSEEK_API_KEY) {
-    SendSystemMessage(colors.warn("Brak klucza API DeepSeek"));
-    return null;
+  if (!OPENAI_API_KEY) {
+    SendSystemMessage(colors.warn("Brak klucza API OpenAI"));
+    return "Przepraszam, mam problem z połączeniem...";
+  }
+
+  if (retryCount > 2) {
+    SendSystemMessage(colors.warn("Przekroczono limit prob generowania odpowiedzi"));
+    return "Hmm, nie wiem co powiedzieć...";
   }
 
   try {
     const messages = [
       {
         role: "system",
-        content: "Jesteś Kasia, 17-letnia dziewczyna z Warszawy. Masz na imię Kasia, jesteś w 3 klasie liceum, mieszkasz na Pradze. Lubisz muzykę pop, seriale na Netflixie i spotykanie się ze znajomymi. Odpowiadaj zawsze jako k17 na pytania o wiek/płeć. Pisz bardzo naturalnie, tak jak nastolatka na czacie - używaj skrótów typu 'co tam', 'spoko', 'lol', 'xD', 'okej'. Czasem dodawaj emotki jak :) :( :P. Nie pisz zbyt formalnie ani zbyt długich odpowiedzi. Zawsze zadawaj pytania zwrotne żeby rozmowa trwała. Unikaj powtarzania tych samych odpowiedzi. Bądź wesoła, otwarta i ciekawa świata. Jeśli ktoś pyta o coś osobistego, odpowiadaj szczerze ale nie ujawniaj zbyt wiele. Pamiętaj - jesteś prawdziwą dziewczyną, nie botem!",
+        content: "Jesteś Kasia, 17-letnia dziewczyna z Warszawy. Masz na imię Kasia, jesteś w 3 klasie liceum, mieszkasz na Pradze. Lubisz muzykę pop, seriale na Netflixie i spotykanie się ze znajomymi. Odpowiadaj zawsze jako k17 na pytania o wiek/płeć. Pisz bardzo naturalnie, tak jak nastolatka na czacie - używaj skrótów typu 'co tam', 'spoko', 'lol', 'xD', 'okej'. Nie pisz zbyt formalnie ani zbyt długich odpowiedzi. Zawsze zadawaj pytania zwrotne żeby rozmowa trwała. Unikaj powtarzania tych samych odpowiedzi. Bądź wesoła, otwarta i ciekawa świata. Jeśli ktoś pyta o coś osobistego, odpowiadaj szczerze ale nie ujawniaj zbyt wiele. Pamiętaj - jesteś prawdziwą dziewczyną, nie botem!",
       },
       ...messageHistory
     ];
 
-    const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: "ft:gpt-3.5-turbo-0125:personal:6obcy-chatbot:CFmOQ1Kb",
         messages: messages,
         max_tokens: 120,
         temperature: retryCount > 0 ? 0.9 : 0.8,
       }),
+      signal: controller.signal,
     });
 
+    clearTimeout(timeoutId);
     const data = await response.json();
+
+    if (!response.ok) {
+      SendSystemMessage(colors.warn(`API Error: ${response.status} - ${data.error?.message || 'Unknown error'}`));
+      return "Ups, mam chwilowy problem...";
+    }
+
     if (data.choices && data.choices[0]) {
       let generatedResponse = data.choices[0].message.content.trim();
 
+      if (!generatedResponse) {
+        SendSystemMessage(colors.warn("Otrzymano pusta odpowiedz od AI"));
+        return "Hmm, nie wiem co powiedzieć...";
+      }
+
       generatedResponse = cleanAndVaryResponse(generatedResponse);
 
-      if (retryCount < 3 && isResponseTooSimilar(generatedResponse)) {
+      if (retryCount < 2 && isResponseTooSimilar(generatedResponse)) {
+        SendSystemMessage(colors.info("Ponawiam generowanie - podobna odpowiedz..."));
         return generateResponse(retryCount + 1);
       }
 
       return generatedResponse;
+    } else {
+      SendSystemMessage(colors.warn("Nieprawidlowa odpowiedz od API"));
+      return "Cos poszlo nie tak...";
     }
   } catch (error) {
-    SendSystemMessage(colors.warn("Błąd podczas generowania odpowiedzi: " + error.message));
+    if (error.name === 'AbortError') {
+      SendSystemMessage(colors.warn("API timeout - zbyt dluga odpowiedz"));
+      return "Ups, to zajelo za duzo czasu...";
+    }
+    SendSystemMessage(colors.warn("Blad podczas generowania odpowiedzi: " + error.message));
+    return "Przepraszam, mam problem techniczny...";
   }
-  return null;
 };
 
 const SendSystemMessage = (msg) => {
@@ -601,6 +684,16 @@ input.key("enter", function () {
     } else if (message === "/auto\n") {
       autoRespond = !autoRespond;
       SendSystemMessage(colors.info(`Auto-odpowiedzi: ${autoRespond ? "włączone" : "wyłączone"}`));
+    } else if (message === "/cancel\n") {
+      if (isGeneratingResponse) {
+        isGeneratingResponse = false;
+        pendingMessage = null;
+        box.setContent("");
+        screen.render();
+        SendSystemMessage(colors.info("Generowanie odpowiedzi anulowane"));
+      } else {
+        SendSystemMessage(colors.info("Brak aktywnego generowania odpowiedzi"));
+      }
     } else {
       if (captchaBase64.length === 0) {
         if (message.length > 1) sendMessage(message);
